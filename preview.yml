@@ -1,0 +1,148 @@
+name: Vercel Preview
+
+permissions:
+  pull-requests: write
+  contents: read
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: deploy-preview-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  Deploy-Preview:
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_[PROJECT_NAME]_PROJECT_ID: ${{ secrets.VERCEL_[PROJECT_NAME]_PROJECT_ID }}
+      VERCEL_[PROJECT_NAME_2]_PROJECT_ID: ${{ secrets.VERCEL_[PROJECT_NAME_2]_PROJECT_ID }}
+    strategy:
+      matrix:
+        include:
+          - name: "[PROJECT_NAME]"
+            env_var: "VERCEL_APP_PROJECT_ID"
+            path: '[path_to_project]'
+            
+          - name: "[PROJECT_NAME_2]"
+            env_var: "VERCEL_KNOWS_PROJECT_ID"
+            path: '[path_to_project_2]'
+    
+    outputs:
+      deployment_urls: ${{ toJSON(steps.collect-urls.outputs) }}
+
+    steps:
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.11.0
+          run_install: false
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        name: Restore pnpm store directory
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - uses: actions/checkout@v2
+      
+      - name: Install Vercel CLI
+        run: pnpm install --global vercel@37.8.0
+
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }} --scope=[org_name]
+        env:
+          VERCEL_PROJECT_ID: ${{ env[matrix.env_var] }}
+
+      - name: Build Project Artifacts
+        run: vercel build --token=${{ secrets.VERCEL_TOKEN }} --scope=[org_name]
+        env:
+          VERCEL_PROJECT_ID: ${{ env[matrix.env_var] }}
+
+      - name: Deploy Project Artifacts to Vercel
+        id: deploy
+        run: |
+          URL=$(vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }} --scope=[org_name] --skip-domain)
+          TIME=$(date -u "+%b %-d, %Y %-I:%M%P")
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "time=$TIME" >> $GITHUB_OUTPUT
+        env:
+          VERCEL_PROJECT_ID: ${{ env[matrix.env_var] }}
+
+      - name: Find Existing Comment
+        uses: peter-evans/find-comment@v2
+        id: find-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: Preview Deployments
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Existing Deployments
+        uses: actions/download-artifact@v3
+        continue-on-error: true
+        with:
+          name: deployment-data
+          path: ./existing-urls
+
+      - name: Update Deployment Data
+        id: update-data
+        run: |
+          mkdir -p ./merged-urls
+          
+          # Copy existing data (if it exists)
+          if [ -f "./existing-urls/deployments.json" ]; then
+            cp "./existing-urls/deployments.json" "./merged-urls/deployments.json"
+          else
+            echo "{}" > "./merged-urls/deployments.json"
+          fi
+          
+          # Update current deployment data
+          current_data=$(jq --arg name "${{ matrix.name }}" \
+                          --arg url "${{ steps.deploy.outputs.url }}" \
+                          --arg time "${{ steps.deploy.outputs.time }}" \
+                          '. + {($name): {"url": $url, "time": $time}}' \
+                          "./merged-urls/deployments.json")
+          echo "$current_data" > "./merged-urls/deployments.json"
+          
+          # Generate table rows
+          {
+            echo "table_rows<<EOF"
+            echo "$current_data" | jq -r 'to_entries[] | "| **\(.key)** | \(.value.url) | \(.value.time) |"'
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      # Reference: https://github.com/orgs/community/discussions/17245
+      # The better way to share outputs between jobs is to use artifacts
+      - name: Upload Updated Deployment Data
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-data
+          path: ./merged-urls/deployments.json
+          retention-days: 1
+
+      - name: Update PR Comment
+        uses: peter-evans/create-or-update-comment@v3
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            ## Preview Deployments 🚀
+            
+            | Project | Deployment | Updated (UTC) |
+            |---------|------------|---------------|
+            ${{ steps.update-data.outputs.table_rows }}
+            
+            *Deployments are updated as they complete. Last update: ${{ steps.deploy.outputs.time }} UTC*
